@@ -1,5 +1,7 @@
-from email.utils import formatdate
+import base64
+import hashlib
 import os
+from email.utils import formatdate, parsedate
 from posixpath import normpath
 from wsgiref.headers import Headers
 from wsgiref.util import FileWrapper
@@ -163,3 +165,87 @@ class WhiteNoise(object):
         This is provided as a hook for sub-classes, by default a no-op
         """
         pass
+
+
+class HashedEtagWhiteNoise(WhiteNoise):
+    """`
+    Differences from parent class: Adds ETags and checks If-None-Match to
+    conform with RFC 7232.
+
+    https://github.com/evansd/whitenoise/blob/master/whitenoise/base.py
+    """
+
+    class StaticFile(StaticFile):
+
+        def __init__(self, path, headers):
+            super().__init__(path, headers)
+            self.etag = headers['etag']
+
+        def _if_none_match_etag(self, inm_header):
+            """
+            Returns True iff self.etag is in the parsed inm_header.
+
+            Parses If-None-Match for the condition in RFC 7232 s. 3.2.
+            https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/If-None-Match
+
+            :param inm_header: If-None-Match raw header.
+            """
+            if not self.etag or not inm_header:
+                return False
+
+            if inm_header.startswith("W/"):
+                inm_header = inm_header[2:]
+
+            client_etags = inm_header.split(",")
+            for etag in client_etags:
+                if etag.strip() == self.etag:
+                    return True
+
+            return False
+
+        def file_not_modified(self, request_headers):
+            """
+            Overrides the parent class to handle ETags.
+
+            :param request_headers:
+            """
+            # If-None-Match for etags
+            if 'HTTP_IF_NONE_MATCH' in request_headers:
+                return self._if_none_match_etag(
+                    request_headers['HTTP_IF_NONE_MATCH']
+                )
+
+            # upstream logic for If-Modified-Since header
+            try:
+                last_requested = request_headers['HTTP_IF_MODIFIED_SINCE']
+            except KeyError:
+                return False
+            return parsedate(last_requested) >= self.last_modified
+
+    def add_etag_headers(self, headers, path, url):
+        """
+        Adds etag header. Should only be called when the file is first
+        traversed on __init__(), or in autorefresh (debug) mode, when the file
+        is refreshed.
+        """
+        hasher = hashlib.md5()
+        with open(path, 'rb') as file:
+            hasher.update(file.read())
+        b64hash = base64.b64encode(hasher.digest()).decode()
+        headers['etag'] = '"{:s}"'.update(b64hash)
+
+    def get_static_file(self, path, url):
+        """
+        Reiteration of parent class method with overriden StaticFile class and
+        an extra call to add_etag_headers().
+        """
+        headers = Headers([])
+        self.add_stat_headers(headers, path, url)
+        self.add_mime_headers(headers, path, url)
+        self.add_cache_headers(headers, path, url)
+        self.add_cors_headers(headers, path, url)
+        self.add_etag_headers(headers, path, url)
+        self.add_extra_headers(headers, path, url)
+        if self.add_headers_function:
+            self.add_headers_function(headers, path, url)
+        return self.StaticFile(path, headers)

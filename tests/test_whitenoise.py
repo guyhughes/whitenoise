@@ -1,12 +1,14 @@
+import hashlib
+import base64
 import os
+import shutil
 import tempfile
 from unittest import TestCase
-import shutil
 from wsgiref.simple_server import demo_app
 
 from .utils import TestServer, Files
 
-from whitenoise import WhiteNoise
+from whitenoise import WhiteNoise, HashedEtagWhiteNoise
 
 
 # Update Py2 TestCase to support Py3 method names
@@ -159,3 +161,89 @@ def copytree(src, dst):
             shutil.copytree(src_path, dst_path)
         else:
             shutil.copy2(src_path, dst_path)
+
+
+class HashedETagTest(WhiteNoiseTest):
+
+    @classmethod
+    def setUpClass(cls):
+        super(HashedETagTest, cls).setUpClass()
+        cls.application = HashedEtagWhiteNoise(demo_app, root=cls.files.directory)
+        cls.server = TestServer(cls.application)
+
+    @classmethod
+    def init_files(cls):
+        cls.files = super(HashedEtagWhiteNoise, cls).init_files()
+        hasher = hashlib.md5()
+        for f in cls.files:
+            with open(f.plain_file[0], 'rb') as fp:
+                f.data = fp.read()
+            f.hash = hasher.update(f.data)
+
+    def test_200s(self):
+        for file in self.files + self.immutable_files:
+            self._assert_200(**file)
+            self._assert_200(if_none_match_header='invalid', **file)
+            self._assert_200(if_none_match_header='"invalid"', **file)
+            self._assert_200(if_none_match_header='W/"randomstuff"', **file)
+            self._assert_200(if_none_match_header='W/,,"random,stuff",',
+                             **file)
+
+    def test_304_ordinary(self):
+        for file in self.files + self.immutable_files:
+            self._assert_304(if_none_match_header=file["etag"], **file)
+
+    def test_304_weak(self):
+        for file in self.files:
+            self._assert_304(if_none_match_header='W/{:s}'.format({file["etag"]}), **file)
+
+    def test_304_list_last(self):
+        for file in self.files:
+            self._assert_304(
+                if_none_match_header='"randomvalue", "somevalue", {file["etag"]}',
+                **file)
+
+    def test_304_list_middle(self):
+        for file in self.files:
+            self._assert_304(
+                if_none_match_header='"something","weid", "breakmyparser",{:s}, "random", "whatever"'.format(
+                    file["etag"]), **file)
+
+    def test_304_list_first(self):
+        for file in self.files:
+            self._assert_304(
+                if_none_match_header='{file["etag"]}, "random","oops", "whatever"',
+                **file)
+
+    def test_304_weak(self):
+        for file in self.files:
+            self._assert_304(
+                if_none_match_header='W/"randomvalue", "somevalue", {file["etag"]} ',
+                **file)
+
+    def test_304_dangling_comma(self):
+        for file in self.files:
+            self._assert_304(
+                    if_none_match_header='W/"randomvalue", "somevalue", {:s}, what,'.format(
+                        file['etag']),
+                    **file)
+
+    def _assert_200(self, filename, etag, data, if_none_match_header=None):
+        response = self.server.get(
+                "/{:s}".format(filename),
+                headers={"If-None-Match": if_none_match_header}
+        )
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(data, response.content)
+        self.assertEqual(
+            response.headers['Etag'],
+            etag)
+
+    def _assert_304(self, filename, if_none_match_header, etag, data=None):
+        response = self.server.get(
+                "/{:s}".format(filename),
+                headers={"If-None-Match": if_none_match_header}
+        )
+        self.assertEqual(304, response.status_code)
+        self.assertEqual(response.content, b"")
+        self.assertEqual(response.headers["ETag"], etag)
